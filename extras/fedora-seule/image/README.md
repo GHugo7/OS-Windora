@@ -18,7 +18,7 @@ Depuis une Fedora (n'importe laquelle, avec ~30 Go libres) :
 
 ```sh
 sudo dnf install podman
-cd OS-Windora/fedora
+cd OS-Windora/extras/fedora-seule
 ./image/build-iso.sh
 ```
 

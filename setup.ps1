@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Windora (variante Windows) : Windows pour les jeux et les .exe, la vraie Fedora
+    Windora : Windows pour les jeux et les .exe, la vraie Fedora
     intégrée (WSL) pour les commandes et les logiciels Linux.
 
 .DESCRIPTION
@@ -805,7 +805,7 @@ function Start-Main {
         return
     }
 
-    Write-Host "Windora $($script:Version) - variante Windows" -ForegroundColor Cyan
+    Write-Host "Windora $($script:Version)" -ForegroundColor Cyan
     $build = [Environment]::OSVersion.Version.Build
     if ($build -lt 19045) { throw 'Windows 10 22H2 ou Windows 11 est nécessaire.' }
     New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null

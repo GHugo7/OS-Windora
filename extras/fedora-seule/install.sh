@@ -211,7 +211,7 @@ check_system() {
 
     if [[ -e /run/ostree-booted ]]; then
         die "Fedora Atomic (Silverblue, Kinoite, Bazzite...) détectée : ce script modifie le système avec dnf.
-Utilisez plutôt l'image (voir fedora/image/README.md), ou Bazzite qui contient déjà tout."
+Utilisez plutôt l'image (voir extras/fedora-seule/image/README.md), ou Bazzite qui contient déjà tout."
     fi
 
     if ((EUID == 0)); then

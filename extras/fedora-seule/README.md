@@ -1,4 +1,4 @@
-# Variante 1 : Fedora d'abord
+# Extra : Fedora seule (sans Windows)
 
 Une Fedora normale (Workstation GNOME ou KDE), transformée par un script en PC de jeu qui
 **lance les `.exe` comme sous Windows** : double-clic, `./setup.exe` dans un terminal,
@@ -7,7 +7,7 @@ raccourcis dans le menu après une installation, Steam, Epic, GOG, Battle.net…
 > **Limite à connaître :** les jeux protégés par un anti-triche « noyau » (Valorant,
 > League of Legends, Fortnite…) ne marchent **pas** sous Linux. Voir
 > [Ce qui marche, ce qui ne marche pas](#ce-qui-marche-ce-qui-ne-marche-pas). Si ces jeux
-> comptent pour toi, regarde aussi la [variante Windows](../windows/README.md).
+> comptent pour toi, utilise plutôt [Windora](../../README.md).
 
 ## Installation
 
@@ -15,7 +15,7 @@ Sur une **Fedora 43, 44 ou 45** installée (pas Silverblue/Kinoite) :
 
 ```sh
 git clone https://github.com/GHugo7/OS-Windora.git
-cd OS-Windora/fedora
+cd OS-Windora/extras/fedora-seule
 ./install.sh            # pose quelques questions, demande le mot de passe (sudo)
 ```
 
