@@ -319,7 +319,24 @@ function Test-WslReady {
     }
 }
 
+# Sur un Windows tout juste installé, winget n'est activé que quelques minutes après la première
+# ouverture de session : on demande son enregistrement (méthode documentée par Microsoft).
+$script:WingetTried = $false
+function Initialize-Winget {
+    if ($script:WingetTried -or (Get-Command winget.exe -ErrorAction SilentlyContinue)) { return }
+    $script:WingetTried = $true
+    try {
+        Add-AppxPackage -RegisterByFamilyName -MainPackage 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe' -ErrorAction Stop
+    } catch {
+        Write-Verbose "Enregistrement de winget impossible : $($_.Exception.Message)"
+    }
+    for ($i = 0; $i -lt 12 -and -not (Get-Command winget.exe -ErrorAction SilentlyContinue); $i++) {
+        Start-Sleep -Seconds 5
+    }
+}
+
 function Install-WingetPackage([string]$Id, [string]$Label) {
+    Initialize-Winget
     if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
         Write-Warn "winget est absent : installe « $Label » à la main (ou installe « Programme d'installation d'application » depuis le Microsoft Store)."
         return

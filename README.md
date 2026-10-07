@@ -17,6 +17,9 @@ officielle** (via WSL, le sous-système Linux de Microsoft) :
   `.exe` : Windows ;
 - Windows est **allégé** (applis inutiles, télémétrie, pubs) et **habillé façon GNOME**.
 
+Windora s'installe sur un Windows existant, ou **d'un seul coup avec Windows sur un PC vide**,
+depuis un ISO ou une clé USB (voir [Installation complète](#installation-complète-sur-un-pc-vide-iso-ou-clé-usb)).
+
 ## Installation
 
 Sur **Windows 11** (Windows 10 22H2 fonctionne, mais n'est plus maintenu) :
@@ -45,6 +48,42 @@ Options (à ajouter après `installer.cmd` ou `setup.ps1`) :
 | `-UserName hugo` | nom du compte Linux |
 | `-Yes` | aucune question |
 | `-Restore` | annule l'habillage, l'allègement et l'intégration |
+
+## Installation complète sur un PC vide (ISO ou clé USB)
+
+Windora peut aussi s'installer **en même temps que Windows**, sur un PC vide ou un disque neuf :
+une seule installation, et à la première ouverture de session tout se met en place (Fedora,
+intégration, allègement, apparence).
+
+La licence de Windows interdit de distribuer Windows lui-même : Windora ne fournit donc pas
+d'ISO tout fait, il **transforme ton ISO officiel de Windows** (gratuit chez Microsoft) en ISO
+Windora, sur ton PC :
+
+1. Télécharge l'ISO de Windows 11 sur
+   [microsoft.com/software-download/windows11](https://www.microsoft.com/software-download/windows11)
+   (« Télécharger l'image disque (ISO) de Windows 11 »).
+2. Double-clique sur **`creer-iso.cmd`** et choisis cet ISO : il crée `Windora-<nom>.iso` à côté.
+   La première fois, il propose d'installer **oscdimg**, l'outil de Microsoft qui fabrique les
+   ISO de Windows (kit ADK, partie « Outils de déploiement » seulement).
+3. Écris l'ISO sur une clé USB avec [Rufus](https://rufus.ie). À la question « Personnalisation
+   de l'installation de Windows », **décoche tout** (sinon Rufus remplace le fichier de Windora).
+4. Démarre le PC sur la clé et installe Windows comme d'habitude : langue, disque, compte. À la
+   première ouverture de session, l'installation de Windora s'ouvre toute seule (mêmes étapes
+   qu'au-dessus, avec l'autorisation administrateur).
+
+**Encore plus simple, sans fabriquer d'ISO** : crée une clé d'installation avec l'outil de
+création de support de Microsoft (même page), puis lance `creer-iso.cmd -Cle E:` (E: = la clé).
+
+```powershell
+creer-iso.cmd -Iso D:\Win11_25H2_French_x64.iso -Sortie D:\Windora.iso   # chemins choisis
+creer-iso.cmd -Cle E:                                                     # clé USB
+```
+
+Par rapport à une installation normale de Windows, seuls deux éléments sont ajoutés : un fichier
+`autounattend.xml` (le moyen prévu par Microsoft pour automatiser une installation) qui lance
+Windora à la première ouverture de session, et le dossier `C:\Windora`. **Rien n'est contourné**
+(TPM 2.0, Secure Boot, activation) : Vanguard en a besoin. Rien n'est effacé sans que tu
+choisisses le disque. L'ISO créé contient Windows : il est pour toi, ne le partage pas.
 
 ## Au quotidien
 
@@ -156,7 +195,7 @@ C'est exactement ce que fait Windora, sous la seule forme possible :
 ## Limites honnêtes
 
 - Le bureau reste celui de Windows (habillé façon GNOME) : WSL fait tourner les **applications**
-  Linux, pas un bureau GNOME complet.
+  Linux, pas un bureau GNOME complet. Même installé depuis l'ISO, le PC démarre sur Windows.
 - Ce qui touche au matériel et au démarrage (noyau Linux, GRUB, Wi-Fi, veille) est géré par
   Windows : ces commandes Fedora n'ont pas d'effet.
 - Le projet n'a pas pu être exécuté sur un vrai Windows pendant sa création : il a été vérifié
@@ -177,6 +216,8 @@ Le dossier [`extras/`](extras) contient deux projets annexes, indépendants de W
 | Fichier | Rôle |
 |---|---|
 | `installer.cmd` | à double-cliquer : lance l'installation |
+| `creer-iso.cmd` | à double-cliquer : fabrique l'ISO Windora (ou prépare une clé USB) |
+| `iso/` | l'outil ISO : `creer-iso.ps1`, `autounattend.xml`, `premiere-session.ps1` |
 | `setup.ps1` | le script d'installation (Windows PowerShell) |
 | `allegement.psd1` | la liste de l'allègement de Windows |
 | `fxw-profile.ps1` | les commandes Fedora dans PowerShell |

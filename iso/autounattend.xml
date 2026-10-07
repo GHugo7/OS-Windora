@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Windora : fichier de réponses de l'installation de Windows (ajouté par creer-iso.ps1).
+
+  Il ne fait qu'une chose : à la première ouverture de session, il prépare la suite de
+  l'installation de Windora (Fedora, intégration, allègement, apparence), qui démarre une
+  fois le bureau affiché.
+
+  Tout le reste de l'installation de Windows est normal : tu choisis la langue, le disque
+  et le compte. Rien n'est effacé automatiquement et rien n'est contourné (TPM, Secure
+  Boot, activation) : Vanguard en a justement besoin.
+
+  Le dossier Windora est copié dans C:\Windora par Windows (dossier sources\$OEM$\$1 du
+  support). Si ce n'est pas le cas, la commande ci-dessous le reprend sur la clé ou l'ISO.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Windora : suite de l'installation</Description>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$d = Join-Path $env:SystemDrive 'Windora'; if (-not (Test-Path (Join-Path $d 'setup.ps1'))) { foreach ($r in [IO.DriveInfo]::GetDrives()) { $s = Join-Path $r.Name 'sources\$OEM$\$1\Windora'; if (Test-Path (Join-Path $s 'setup.ps1')) { Copy-Item $s $d -Recurse -Force; break } } }; &amp; (Join-Path $d 'premiere-session.ps1')"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Windora : suite de l'installation</Description>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$d = Join-Path $env:SystemDrive 'Windora'; if (-not (Test-Path (Join-Path $d 'setup.ps1'))) { foreach ($r in [IO.DriveInfo]::GetDrives()) { $s = Join-Path $r.Name 'sources\$OEM$\$1\Windora'; if (Test-Path (Join-Path $s 'setup.ps1')) { Copy-Item $s $d -Recurse -Force; break } } }; &amp; (Join-Path $d 'premiere-session.ps1')"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>
