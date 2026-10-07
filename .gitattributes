@@ -1,0 +1,16 @@
+# Les scripts exécutés par Linux (bash) doivent garder des fins de ligne LF, même quand le
+# dépôt est cloné avec Git pour Windows (qui convertit par défaut en CRLF).
+fedora/**                   text eol=lf
+extras/fedora-seule/**      text eol=lf
+extras/novaos/**            text eol=lf
+*.sh                        text eol=lf
+
+# Fichiers Windows.
+*.cmd                       text eol=crlf
+*.ps1                       text eol=crlf
+*.psd1                      text eol=crlf
+
+# Binaires.
+*.jpg                       binary
+*.png                       binary
+*.svg                       text eol=lf

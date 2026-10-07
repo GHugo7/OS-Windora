@@ -1,21 +1,32 @@
 #!/usr/bin/bash
-# fxw-exec <commande> [arguments...] : lance une commande Fedora appelée depuis PowerShell.
-#  - les chemins Windows (C:\Users\..., \\serveur\...) deviennent des chemins Linux ;
-#  - les jokers (*.txt, photo?.png) sont développés comme le ferait bash.
+# fxw-exec : lance une commande Fedora demandée depuis PowerShell (fxw-profile.ps1).
+#
+# Windows PowerShell 5.1 transmet mal les arguments aux programmes (guillemets, arguments
+# vides) : le profil les envoie donc à part, dans FXW_ARGS (séparés par des octets nuls,
+# en base64). Sans FXW_ARGS, les arguments de la ligne de commande sont pris tels quels.
+#  - ~ et ~/… désignent le dossier personnel de Fedora ;
+#  - les chemins Windows (C:\Users\…, \\serveur\…) deviennent des chemins Linux.
+# Les jokers (*.txt) sont développés par le profil, seulement s'ils ont été tapés sans
+# guillemets : '*.txt' entre guillemets reste tel quel, comme dans bash.
+if [[ -n "${FXW_ARGS:-}" ]]; then
+    mapfile -d '' -t raw < <(printf '%s' "$FXW_ARGS" | base64 -d)
+    unset FXW_ARGS
+else
+    raw=("$@")
+fi
+
+tilde='~'
 args=()
-first=1
-for a in "$@"; do
-    if [[ "$a" =~ ^[A-Za-z]:[\\/] || "$a" == \\\\* ]]; then
+for a in "${raw[@]}"; do
+    if [[ "$a" == "$tilde" ]]; then
+        a="$HOME"
+    elif [[ "$a" == "$tilde/"* || "$a" == "$tilde\\"* ]]; then
+        a="$HOME/${a:2}"
+    elif [[ "$a" =~ ^[A-Za-z]:[\\/] || "$a" == \\\\* ]]; then
         a="$(wslpath -u "$a" 2>/dev/null || printf '%s' "$a")"
     fi
-    if ((!first)) && [[ "$a" != -* && "$a" == *[*?[]* ]]; then
-        mapfile -t matches < <(compgen -G "$a")
-        if ((${#matches[@]})); then
-            args+=("${matches[@]}")
-            continue
-        fi
-    fi
     args+=("$a")
-    first=0
 done
+
+((${#args[@]})) || exit 0
 exec "${args[@]}"

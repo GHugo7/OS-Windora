@@ -7,6 +7,8 @@
 #   installer --windows Steam         logiciel Windows via winget
 #   installer firefox Discord.exe     tout mélangé dans une seule commande
 
+# Le code PowerShell est écrit entre apostrophes : ses $ sont pour PowerShell, pas pour bash.
+# shellcheck disable=SC2016
 set -uo pipefail
 
 PAUSE=0
@@ -34,7 +36,7 @@ installer - logiciels Fedora et Windows, avec une seule commande
 
   -w, --windows   les noms qui suivent sont des logiciels Windows (winget)
   -f, --fedora    les noms qui suivent sont des paquets Fedora (par défaut)
-      --pause     attend Entrée à la fin (utilisé par le double-clic sur un .rpm)
+      --pause     demande confirmation et attend Entrée à la fin (double-clic sur un .rpm)
   -h, --help      cette aide
 
 Exemples :
@@ -62,6 +64,14 @@ to_linux_path() {
     fi
 }
 
+# Dossier temporaire de Windows (%TEMP%), en chemin Linux.
+# cmd /u écrit en UTF-16 : les noms accentués (C:\Users\Hélène) arrivent intacts.
+windows_temp() {
+    local t
+    t="$(cd /mnt/c 2>/dev/null && cmd.exe /d /u /c 'echo %TEMP%' 2>/dev/null | iconv -f UTF-16LE -t UTF-8 | tr -d '\r\n')"
+    [[ -n "$t" ]] && wslpath -u "$t"
+}
+
 # Un fichier présent dans Fedora (hors /mnt/c...) doit être copié côté Windows pour y être lancé.
 windows_path_for() {
     local f="$1"
@@ -69,17 +79,25 @@ windows_path_for() {
         /mnt/[a-z]/*) wslpath -w "$f" ;;
         *)
             local dir
-            dir="$(wslpath -u "$(cmd.exe /c 'echo %TEMP%' 2>/dev/null | tr -d '\r')")/windora"
+            dir="$(windows_temp)" || return 1
+            dir="$dir/windora"
             mkdir -p -- "$dir" && cp -f -- "$f" "$dir/" && wslpath -w "$dir/$(basename -- "$f")"
             ;;
     esac
 }
 
-# Échappe une chaîne pour PowerShell entre apostrophes.
-ps_quote() { printf "'%s'" "${1//\'/\'\'}"; }
+# Lance du code PowerShell sous Windows. La valeur ($2) passe par la variable d'environnement
+# FXW_ARG, jamais dans le texte du code : un nom de fichier avec une apostrophe (y compris
+# typographique, ’) ne peut ni casser la commande ni y injecter du code.
+ps_run() {
+    FXW_ARG="$2" WSLENV="${WSLENV:+$WSLENV:}FXW_ARG" powershell.exe -NoProfile -NonInteractive -Command "$1"
+}
 
+# Code de sortie : 0 = paquet Fedora, 1 = inconnu de Fedora, 2 = dépôts injoignables.
 is_fedora_package() {
-    [[ -n "$(dnf -q repoquery --latest-limit=1 -- "$1" 2>/dev/null)" ]]
+    local out
+    out="$(dnf -q repoquery --latest-limit=1 -- "$1" 2>/dev/null)" || return 2
+    [[ -n "$out" ]]
 }
 
 classify() {
@@ -99,33 +117,48 @@ classify() {
     fi
     if ((FORCE_WINDOWS)); then
         WINGET_PKGS+=("$item")
-    elif is_fedora_package "$item"; then
-        FEDORA_PKGS+=("$item")
-    else
-        info "« $item » n'existe pas dans Fedora : recherche côté Windows (winget)."
-        WINGET_PKGS+=("$item")
+        return
     fi
+    is_fedora_package "$item"
+    case $? in
+        0) FEDORA_PKGS+=("$item") ;;
+        1)
+            info "« $item » n'existe pas dans Fedora : recherche côté Windows (winget)."
+            WINGET_PKGS+=("$item")
+            ;;
+        *) fail "dépôts Fedora injoignables : impossible de savoir si « $item » est un paquet Fedora (connexion Internet ?). Pour un logiciel Windows : installer --windows $item" ;;
+    esac
 }
 
 install_fedora() {
     ((${#FEDORA_PKGS[@]} + ${#RPM_FILES[@]})) || return 0
-    info "Fedora : ${FEDORA_PKGS[*]} ${RPM_FILES[*]##*/}"
-    sudo dnf install -y "${FEDORA_PKGS[@]}" "${RPM_FILES[@]}" || fail "l'installation Fedora a échoué"
+    local names=("${FEDORA_PKGS[@]}" "${RPM_FILES[@]##*/}")
+    info "Fedora : ${names[*]}"
+    local yes=(-y)
+    if ((PAUSE && ${#RPM_FILES[@]})); then
+        # Double-clic sur un .rpm téléchargé : il s'installe en administrateur (root), on demande.
+        warn "Un paquet .rpm s'installe avec les droits administrateur de Fedora :"
+        warn "n'accepte que s'il vient d'une source de confiance."
+        yes=()
+    fi
+    sudo dnf install "${yes[@]}" "${FEDORA_PKGS[@]}" "${RPM_FILES[@]}" || fail "l'installation Fedora a échoué ou a été annulée"
 }
 
 run_windows_file() {
     local f="$1" win
     win="$(windows_path_for "$f")" || { fail "impossible de préparer $f pour Windows"; return; }
     info "Windows : $(basename -- "$f")"
+    # L'installeur s'ouvre sur le bureau Windows et on attend qu'il se termine. WaitForExit()
+    # n'attend que lui (Start-Process -Wait attendrait aussi l'appli qu'il lance à la fin).
+    # $p.Handle est lu tout de suite : sans cela, ExitCode serait vide une fois le processus fini.
     case "${f,,}" in
         *.exe)
-            # Start-Process -Wait : l'installeur s'ouvre sur le bureau Windows, on attend sa fin.
-            powershell.exe -NoProfile -Command "\$p = Start-Process -FilePath $(ps_quote "$win") -Wait -PassThru; exit \$p.ExitCode" ;;
+            ps_run '$p = Start-Process -FilePath $env:FXW_ARG -PassThru; $null = $p.Handle; $p.WaitForExit(); exit $p.ExitCode' "$win" ;;
         *.msi)
-            # [char]34 = guillemet : évite d'en faire passer un vrai par la ligne de commande Windows.
-            powershell.exe -NoProfile -Command "\$p = Start-Process msiexec.exe -ArgumentList '/i', ([char]34 + $(ps_quote "$win") + [char]34) -Wait -PassThru; exit \$p.ExitCode" ;;
+            # [char]34 = guillemet : le chemin reste en un seul morceau pour msiexec.
+            ps_run '$p = Start-Process msiexec.exe -ArgumentList ("/i " + [char]34 + $env:FXW_ARG + [char]34) -PassThru; $null = $p.Handle; $p.WaitForExit(); exit $p.ExitCode' "$win" ;;
         *)
-            powershell.exe -NoProfile -Command "Add-AppxPackage -Path $(ps_quote "$win")" ;;
+            ps_run 'try { Add-AppxPackage -Path $env:FXW_ARG -ErrorAction Stop } catch { Write-Host $_.Exception.Message; exit 1 }' "$win" ;;
     esac
     local status=$?
     ((status == 0 || status == 3010)) || fail "$(basename -- "$f") s'est terminé avec le code $status"
@@ -137,7 +170,7 @@ install_winget() {
     local pkg
     for pkg in "${WINGET_PKGS[@]}"; do
         info "Windows (winget) : $pkg"
-        powershell.exe -NoProfile -Command "winget install $(ps_quote "$pkg") --source winget --accept-package-agreements --accept-source-agreements; exit \$LASTEXITCODE" ||
+        ps_run 'winget install $env:FXW_ARG --source winget --accept-package-agreements --accept-source-agreements; exit $LASTEXITCODE' "$pkg" ||
             fail "winget n'a pas pu installer « $pkg » (essayez : winget search $pkg)"
     done
 }

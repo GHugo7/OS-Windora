@@ -13,7 +13,8 @@ officielle** (via WSL, le sous-système Linux de Microsoft) :
 - les **applications Linux** (Fichiers, éditeur de texte, GIMP…) apparaissent dans le
   **menu Démarrer**, dans un dossier « Fedora » ;
 - **`installer`** installe des logiciels **Fedora et Windows dans la même commande** ;
-- **double-clic sur un `.rpm`** : installé dans Fedora. Double-clic sur un `.exe` : Windows ;
+- **double-clic sur un `.rpm`** : installé dans Fedora (après confirmation). Double-clic sur un
+  `.exe` : Windows ;
 - Windows est **allégé** (applis inutiles, télémétrie, pubs) et **habillé façon GNOME**.
 
 ## Installation
@@ -77,6 +78,10 @@ de Fedora sont visibles dans l'Explorateur, rubrique **Linux > Fedora**
 | `htop`, `nano`, `git`… (inconnues de Windows) | Fedora |
 | `Get-ChildItem`, `Get-Process`… | Windows (PowerShell) |
 | un script `.ps1` qui utilise `ls` ou `rm` | Windows : les scripts ne changent pas de comportement |
+
+Comme dans bash, `ls *.txt` développe le joker et `ls '*.txt'` (entre guillemets) ne le fait
+pas ; `~` est ton dossier Fedora. Dans un PowerShell **administrateur**, ou hors d'un disque
+local (registre, partage réseau), les commandes restent celles de Windows.
 
 Attention : `rm -rf` est donc le vrai `rm` de Linux, sans corbeille. `ps` et `kill` agissent
 sur les programmes de Fedora. Pour ceux de Windows : `Get-Process`, `Stop-Process`, ou le

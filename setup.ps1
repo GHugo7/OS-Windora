@@ -45,7 +45,9 @@ param(
     # Usage interne : phase administrateur, fichier de résultat, reprise après redémarrage.
     [switch]$AdminPhase,
     [string]$ResultFile,
-    [switch]$Resume
+    [switch]$Resume,
+    [string]$BackupFile,
+    [string]$ParentSid
 )
 
 Set-StrictMode -Version 2.0
@@ -173,6 +175,14 @@ function Set-RegistryValue([string]$Path, [string]$Name, $Value, [string]$Kind =
     }
 }
 
+# Ce réglage a-t-il déjà été sauvegardé lors d'un passage précédent ?
+function Test-AlreadyBackedUp([string]$Type, [string]$Path) {
+    foreach ($e in @(Read-JsonFile $script:UserBackup)) {
+        if ($e -and $e.Type -eq $Type -and $e.Path -eq $Path) { return $true }
+    }
+    return $false
+}
+
 function Save-Backup([string]$File) {
     $previous = @()
     $old = Read-JsonFile $File
@@ -194,6 +204,7 @@ function Save-Backup([string]$File) {
 function Restore-Backup([string]$File) {
     $entries = Read-JsonFile $File
     if (-not $entries) { return }
+    $failed = New-Object System.Collections.Generic.List[object]
     foreach ($e in @($entries)) {
         try {
             switch ($e.Type) {
@@ -210,12 +221,29 @@ function Restore-Backup([string]$File) {
                 'Task' {
                     Enable-ScheduledTask -TaskPath $e.Path -TaskName $e.Name | Out-Null
                 }
+                'ExecutionPolicy' {
+                    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy $e.Value -Force
+                }
+                'File' {
+                    # Fichier modifié : on remet la copie d'origine, ou on le supprime s'il n'existait pas.
+                    if ($e.Value -and (Test-Path -LiteralPath $e.Value)) {
+                        Move-Item -LiteralPath $e.Value -Destination $e.Path -Force
+                    } elseif (-not $e.Value) {
+                        Remove-Item -LiteralPath $e.Path -Force -ErrorAction SilentlyContinue
+                    }
+                }
             }
         } catch {
-            Write-Warn "Impossible de restaurer $($e.Path)$($e.Name) : $($_.Exception.Message)"
+            Write-Warn "Impossible de restaurer $($e.Path)\$($e.Name) : $($_.Exception.Message)"
+            $failed.Add($e)
         }
     }
-    Remove-Item -LiteralPath $File -Force
+    if ($failed.Count) {
+        # Gardées pour un prochain -Restore (par exemple une fois le blocage levé).
+        Write-Utf8File $File (ConvertTo-Json -InputObject ([object[]]$failed.ToArray()) -Depth 5)
+    } else {
+        Remove-Item -LiteralPath $File -Force
+    }
 }
 
 # ------------------------------------------------------------------ vérifications
@@ -312,7 +340,15 @@ function Invoke-SystemSlimming {
     if (-not (Test-Path -LiteralPath $planFile)) { return }
     $plan = Import-PowerShellDataFile -LiteralPath $planFile
     Write-Step 'Allègement de Windows (réversible avec -Restore)'
+    # La sauvegarde est écrite même si une étape échoue en route.
+    try {
+        Invoke-SystemSlimmingSteps $plan
+    } finally {
+        Save-Backup $script:AdminBackup
+    }
+}
 
+function Invoke-SystemSlimmingSteps($plan) {
     foreach ($svc in $plan.Services) {
         $s = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
         if (-not $s) { continue }
@@ -334,6 +370,15 @@ function Invoke-SystemSlimming {
         if (Set-RegistryValue $reg.Path $reg.Name $reg.Value $reg.Kind) { Write-Ok $reg.Label }
     }
 
+    # Stratégies du compte (HKCU\Software\Policies) : seul un administrateur peut les écrire.
+    # On ne les applique que si l'administrateur est bien le compte de la session.
+    $sameUser = (-not $ParentSid) -or ($ParentSid -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    if ($plan.ContainsKey('AdminUserRegistry') -and $sameUser) {
+        foreach ($reg in $plan.AdminUserRegistry) {
+            if (Set-RegistryValue $reg.Path $reg.Name $reg.Value $reg.Kind) { Write-Ok $reg.Label }
+        }
+    }
+
     foreach ($t in $plan.Tasks) {
         $task = Get-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction SilentlyContinue
         if (-not $task -or $task.State -eq 'Disabled') { continue }
@@ -347,9 +392,12 @@ function Invoke-SystemSlimming {
     }
 
     # Applications préinstallées : retirées pour tous les comptes et des futurs comptes.
+    $provisioned = @()
+    try { $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop) }
+    catch { Write-Warn 'Liste des applications préinstallées indisponible (DISM occupé ?) : seules les copies installées seront retirées.' }
     foreach ($app in $plan.Apps) {
         $found = @(Get-AppxPackage -AllUsers -Name $app.Name -ErrorAction SilentlyContinue)
-        $prov = @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq $app.Name })
+        $prov = @($provisioned | Where-Object { $_.DisplayName -eq $app.Name })
         if (-not $found -and -not $prov) { continue }
         foreach ($p in $found) {
             try { Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop }
@@ -361,7 +409,6 @@ function Invoke-SystemSlimming {
         }
         Write-Ok "retiré : $($app.Label)"
     }
-    Save-Backup $script:AdminBackup
 }
 
 function Invoke-AdminPhase {
@@ -375,8 +422,12 @@ function Invoke-AdminPhase {
     } elseif (-not $result.Readiness.Virtualization) {
         Write-Warn 'La virtualisation est désactivée dans le BIOS : WSL ne peut pas fonctionner.'
     } else {
-        Invoke-Native 'wsl.exe' @('--install', '--no-distribution') | Out-Null
+        $install = Invoke-Native 'wsl.exe' @('--install', '--no-distribution')
         if (-not (Test-WslReady)) {
+            if ($Resume -or ($install.ExitCode -ne 0 -and $install.ExitCode -ne 3010)) {
+                # Déjà redémarré, ou échec franc : redémarrer encore ne servirait à rien.
+                throw "L'installation de WSL a échoué (code $($install.ExitCode)). Vérifie la connexion Internet, puis relance installer.cmd."
+            }
             $result.RebootRequired = $true
             Write-Ok 'WSL installé : un redémarrage est nécessaire'
         }
@@ -437,6 +488,19 @@ function Get-LinuxPath([string]$WindowsPath) {
     return $r.Output.Trim()
 }
 
+# Copie les scripts destinés à Fedora en forçant les fins de ligne Linux (LF) : un clone Git
+# sous Windows ou un éditeur peut les avoir converties en CRLF, que bash refuse.
+function Copy-FedoraScripts {
+    $dest = Join-Path $env:TEMP 'windora-fedora'
+    if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+    foreach ($f in Get-ChildItem -LiteralPath (Join-Path $script:Here 'fedora') -File) {
+        $text = [IO.File]::ReadAllText($f.FullName).Replace("`r`n", "`n")
+        Write-Utf8File (Join-Path $dest $f.Name) $text
+    }
+    return $dest
+}
+
 function Initialize-Fedora {
     Write-Step 'Configuration de Fedora'
     $user = $UserName
@@ -450,7 +514,7 @@ function Initialize-Fedora {
         if ($answer -match '^[a-z_][a-z0-9_-]{0,31}$') { $user = $answer }
     }
 
-    $scripts = Get-LinuxPath (Join-Path $script:Here 'fedora')
+    $scripts = Get-LinuxPath (Copy-FedoraScripts)
     $gui = if ($NoGuiApps) { '0' } else { '1' }
     $dev = if ($NoDev) { '0' } else { '1' }
     Write-Info 'Mise à jour et installation des logiciels (quelques minutes)...'
@@ -472,10 +536,12 @@ function Get-WslProfileGuid {
     $root = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
     if (-not (Test-Path $root)) { return $null }
     foreach ($key in Get-ChildItem $root) {
-        $props = Get-ItemProperty -LiteralPath $key.PSPath
+        $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+        if (-not $props) { continue }
         if ($props.PSObject.Properties.Name -notcontains 'DistributionName') { continue }
         if ($props.DistributionName -ne $script:Distro) { continue }
-        if ($props.PSObject.Properties.Name -contains 'TerminalProfilePath' -and (Test-Path -LiteralPath $props.TerminalProfilePath)) {
+        if ($props.PSObject.Properties.Name -contains 'TerminalProfilePath' -and
+            -not [string]::IsNullOrEmpty($props.TerminalProfilePath) -and (Test-Path -LiteralPath $props.TerminalProfilePath)) {
             $fragment = Read-JsonFile $props.TerminalProfilePath
             foreach ($p in @($fragment.profiles)) {
                 if ($p.PSObject.Properties.Name -contains 'guid' -and $p.PSObject.Properties.Name -contains 'commandline') { return $p.guid }
@@ -492,23 +558,30 @@ function Set-TerminalDefault([string]$Guid) {
         (Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\settings.json')
     )
     $done = $false
-    foreach ($file in $candidates) {
-        $package = Split-Path -Parent (Split-Path -Parent $file)
-        if (-not (Test-Path -LiteralPath $package)) { continue }
+    for ($i = 0; $i -lt $candidates.Count; $i++) {
+        $file = $candidates[$i]
+        # Versions Store/Preview : le dossier du paquet ; version « portable » : son propre dossier.
+        $installDir = if ($i -lt 2) { Split-Path -Parent (Split-Path -Parent $file) } else { Split-Path -Parent $file }
+        if (-not (Test-Path -LiteralPath $installDir)) { continue }
+        $pattern = '("defaultProfile"\s*:\s*")([^"]*)(")'
         if (Test-Path -LiteralPath $file) {
             $text = [IO.File]::ReadAllText($file)
-            $pattern = '("defaultProfile"\s*:\s*")([^"]*)(")'
             $m = [regex]::Match($text, $pattern)
+            # Valeur d'origine ($null = la clé n'existait pas) : -Restore la remettra ou l'enlèvera.
+            $original = if ($m.Success) { $m.Groups[2].Value } else { $null }
             if ($m.Success) {
-                $script:Backup.Add([pscustomobject]@{ Type = 'TerminalDefault'; Path = $file; Name = 'defaultProfile'; Value = $m.Groups[2].Value })
                 $text = [regex]::Replace($text, $pattern, ('${1}' + $Guid + '${3}'), 'None')
             } else {
                 $text = [regex]::Replace($text, '^\s*\{', ("{`n    `"defaultProfile`": `"$Guid`","), 'None')
             }
-            Copy-Item -LiteralPath $file -Destination "$file.avant-fxw" -Force
+            if (-not (Test-Path -LiteralPath "$file.avant-windora")) {
+                Copy-Item -LiteralPath $file -Destination "$file.avant-windora"
+            }
         } else {
+            $original = $null
             $text = "{`n    `"defaultProfile`": `"$Guid`"`n}`n"
         }
+        $script:Backup.Add([pscustomobject]@{ Type = 'TerminalDefault'; Path = $file; Name = 'defaultProfile'; Value = $original })
         Write-Utf8File $file $text
         $done = $true
     }
@@ -527,7 +600,6 @@ function Set-TerminalIntegration {
                 updates = $guid
                 name = 'Fedora'
                 colorScheme = 'Adwaita Dark (Windora)'
-                font = [ordered]@{ face = 'Adwaita Mono'; size = 11 }
                 padding = '10'
                 cursorShape = 'bar'
                 startingDirectory = '~'
@@ -541,6 +613,10 @@ function Set-TerminalIntegration {
                 brightBlack = '#5E5C64'; brightRed = '#ED333B'; brightGreen = '#57E389'; brightYellow = '#F8E45C'
                 brightBlue = '#51A1FF'; brightPurple = '#C061CB'; brightCyan = '#4FD2FD'; brightWhite = '#F6F5F4'
             })
+    }
+    # Police GNOME seulement si elle a bien été installée (sinon le Terminal affiche une erreur).
+    if (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts\AdwaitaMono-Regular.ttf')) {
+        $fragment.profiles[0]['font'] = [ordered]@{ face = 'Adwaita Mono'; size = 11 }
     }
     $fragmentFile = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\Fragments\Windora\fedora.json'
     Write-Utf8File $fragmentFile (ConvertTo-Json -InputObject $fragment -Depth 5)
@@ -572,9 +648,15 @@ function Set-PowerShellIntegration {
     }
 
     # Sans cela, Windows PowerShell refuse de charger les profils (politique « Restricted »).
+    # AllSigned est un choix de sécurité (de l'utilisateur ou de l'entreprise) : on n'y touche pas.
     $policy = Get-ExecutionPolicy -Scope CurrentUser
-    if ($policy -eq 'Undefined' -or $policy -eq 'Restricted' -or $policy -eq 'AllSigned') {
+    $effective = Get-ExecutionPolicy
+    if ($effective -eq 'AllSigned') {
+        Write-Warn 'Politique d''exécution AllSigned : le profil Windora (non signé) ne sera pas chargé dans PowerShell.'
+        Add-Note 'PowerShell est en mode AllSigned : les commandes Fedora y sont désactivées (le Terminal Fedora fonctionne).'
+    } elseif ($effective -eq 'Restricted' -and ($policy -eq 'Undefined' -or $policy -eq 'Restricted')) {
         try {
+            $script:Backup.Add([pscustomobject]@{ Type = 'ExecutionPolicy'; Path = 'CurrentUser'; Name = 'ExecutionPolicy'; Value = [string]$policy })
             Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
             Write-Ok 'scripts locaux autorisés pour ton compte (RemoteSigned)'
         } catch {
@@ -626,8 +708,17 @@ function Set-WslResources {
         'experimental' = [ordered]@{ autoMemoryReclaim = 'dropCache'; sparseVhd = 'true' }
     }
     $lines = New-Object System.Collections.Generic.List[string]
+    $copy = "$file.avant-windora"
+    if (-not (Test-AlreadyBackedUp 'File' $file)) {
+        # Premier passage : on garde l'original ($null = le fichier n'existait pas).
+        $original = $null
+        if (Test-Path -LiteralPath $file) {
+            Copy-Item -LiteralPath $file -Destination $copy -Force
+            $original = $copy
+        }
+        $script:Backup.Add([pscustomobject]@{ Type = 'File'; Path = $file; Name = '.wslconfig'; Value = $original })
+    }
     if (Test-Path -LiteralPath $file) {
-        Copy-Item -LiteralPath $file -Destination "$file.avant-fxw" -Force
         foreach ($l in [IO.File]::ReadAllLines($file)) { $lines.Add($l) }
     }
     foreach ($section in $wanted.Keys) {
@@ -671,18 +762,23 @@ function Install-UserFonts {
     Write-Ok 'polices Adwaita Sans et Adwaita Mono (GNOME)'
 }
 
-function Set-Wallpaper([string]$Path) {
+# Applique un fond d'écran (SPI_SETDESKWALLPAPER), sans toucher au style d'affichage.
+function Invoke-SetWallpaper([string]$Path) {
     if (-not ('FxwNative.FxwWallpaper' -as [type])) {
         Add-Type -Namespace 'FxwNative' -Name 'FxwWallpaper' -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
 public static extern int SystemParametersInfo(int action, int param, string value, int flags);
 '@
     }
+    # SPI_SETDESKWALLPAPER, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
+    [FxwNative.FxwWallpaper]::SystemParametersInfo(0x0014, 0, $Path, 0x03) | Out-Null
+}
+
+function Set-Wallpaper([string]$Path) {
     Set-RegistryValue 'HKCU:\Control Panel\Desktop' 'WallpaperStyle' '10' 'String' | Out-Null
     Set-RegistryValue 'HKCU:\Control Panel\Desktop' 'TileWallpaper' '0' 'String' | Out-Null
     Save-RegistryValue 'HKCU:\Control Panel\Desktop' 'WallPaper'
-    # SPI_SETDESKWALLPAPER, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
-    [FxwNative.FxwWallpaper]::SystemParametersInfo(0x0014, 0, $Path, 0x03) | Out-Null
+    Invoke-SetWallpaper $Path
 }
 
 function Set-GnomeLook {
@@ -735,7 +831,12 @@ function Invoke-Restore {
     foreach ($e in @($userEntries)) {
         if ($e -and $e.Type -eq 'TerminalDefault' -and (Test-Path -LiteralPath $e.Path)) {
             $text = [IO.File]::ReadAllText($e.Path)
-            $text = [regex]::Replace($text, '("defaultProfile"\s*:\s*")([^"]*)(")', ('${1}' + $e.Value + '${3}'))
+            if ($null -eq $e.Value) {
+                # La clé avait été ajoutée par Windora : on l'enlève.
+                $text = [regex]::Replace($text, '\s*"defaultProfile"\s*:\s*"[^"]*"\s*,?', '')
+            } else {
+                $text = [regex]::Replace($text, '("defaultProfile"\s*:\s*")([^"]*)(")', ('${1}' + $e.Value + '${3}'))
+            }
             Write-Utf8File $e.Path $text
         }
     }
@@ -743,6 +844,7 @@ function Invoke-Restore {
     $fragmentDir = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\Fragments\Windora'
     if (Test-Path -LiteralPath $fragmentDir) { Remove-Item -LiteralPath $fragmentDir -Recurse -Force }
     Remove-Item -LiteralPath 'HKCU:\Software\Classes\Windora.rpm' -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'Windora' -ErrorAction SilentlyContinue
     $docs = [Environment]::GetFolderPath('MyDocuments')
     foreach ($profilePath in @((Join-Path $docs 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
             (Join-Path $docs 'PowerShell\Microsoft.PowerShell_profile.ps1'))) {
@@ -751,8 +853,8 @@ function Invoke-Restore {
             Write-Utf8File $profilePath (($kept -join "`r`n") + "`r`n") -Bom
         }
     }
-    $wallpaper = (Get-ItemProperty 'HKCU:\Control Panel\Desktop').WallPaper
-    if ($wallpaper) { Set-Wallpaper $wallpaper }
+    # Réapplique le fond d'écran d'origine (vide = pas de fond), avec son style restauré.
+    Invoke-SetWallpaper ([string](Get-ItemProperty 'HKCU:\Control Panel\Desktop').WallPaper)
     Update-ShellAssociations
     Write-Ok 'réglages de ton compte restaurés'
     if (Test-Path -LiteralPath $script:AdminBackup) {
@@ -761,7 +863,8 @@ function Invoke-Restore {
             Write-Ok 'services et réglages système restaurés'
         } else {
             Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -ArgumentList @('-NoProfile',
-                '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Restore')
+                '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Restore',
+                '-BackupFile', "`"$script:AdminBackup`"")
             return
         }
     }
@@ -794,7 +897,27 @@ function Show-Summary([string]$User) {
     Write-Host ''
 }
 
+# Retire la marque « téléchargé d'Internet » des seuls fichiers de Windora.
+function Unblock-WindoraFiles {
+    $files = New-Object System.Collections.Generic.List[string]
+    foreach ($name in @('installer.cmd', 'setup.ps1', 'allegement.psd1', 'fxw-profile.ps1')) {
+        $files.Add((Join-Path $script:Here $name))
+    }
+    foreach ($dir in @('fedora', 'assets')) {
+        $path = Join-Path $script:Here $dir
+        if (Test-Path -LiteralPath $path) {
+            Get-ChildItem -LiteralPath $path -Recurse -File | ForEach-Object { $files.Add($_.FullName) }
+        }
+    }
+    foreach ($f in $files) {
+        if (Test-Path -LiteralPath $f) { Unblock-File -LiteralPath $f -ErrorAction SilentlyContinue }
+    }
+}
+
 function Start-Main {
+    # Sauvegarde système transmise par le processus parent (le compte administrateur peut
+    # être différent de celui de la session, avec un autre dossier AppData).
+    if ($BackupFile) { $script:AdminBackup = $BackupFile }
     if ($AdminPhase) {
         try {
             $result = Invoke-AdminPhase
@@ -809,7 +932,7 @@ function Start-Main {
     $build = [Environment]::OSVersion.Version.Build
     if ($build -lt 19045) { throw 'Windows 10 22H2 ou Windows 11 est nécessaire.' }
     New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
-    Get-ChildItem -LiteralPath $script:Here -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
+    Unblock-WindoraFiles
 
     if ($Restore) { Invoke-Restore; return }
 
@@ -821,8 +944,15 @@ function Start-Main {
     }
 
     if (-not $Yes -and -not $Resume) {
-        Write-Info 'Ce script installe Fedora dans Windows (WSL), l''intègre au Terminal, à PowerShell et'
-        Write-Info 'à l''Explorateur, allège Windows et l''habille façon GNOME. Tout est réversible (-Restore).'
+        Write-Info 'Ce script installe Fedora dans Windows (WSL) et l''intègre au Terminal, à PowerShell et'
+        Write-Info 'à l''Explorateur. Il installe aussi Windows Terminal, PowerToys et Steam (sauf -NoSteam).'
+        if (-not $NoSlim) {
+            Write-Info 'Allègement (-NoSlim pour l''éviter) : désinstalle Actualités, Météo, Solitaire, To Do,'
+            Write-Info 'Clipchamp, Power Automate, Copilot, Cortana... (réinstallables depuis le Microsoft Store),'
+            Write-Info 'coupe la télémétrie, les pubs et les suggestions. Liste complète : allegement.psd1.'
+        }
+        if (-not $NoLook) { Write-Info 'Apparence (-NoLook pour l''éviter) : thème sombre, fond d''écran, polices GNOME.' }
+        Write-Info 'Les réglages sont réversibles avec -Restore.'
         if (-not (Confirm-Choice 'Continuer ?')) { return }
     }
 
@@ -839,7 +969,9 @@ function Start-Main {
     } else {
         Write-Info 'Windows va demander l''autorisation administrateur (installation de WSL et des applications).'
         $resultFile = Join-Path $env:TEMP "fxw-admin-$PID.json"
-        $childArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-AdminPhase', '-ResultFile', "`"$resultFile`"")
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $childArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-AdminPhase',
+            '-ResultFile', "`"$resultFile`"", '-BackupFile', "`"$script:AdminBackup`"", '-ParentSid', $sid)
         foreach ($name in @('NoSlim', 'NoSteam')) {
             if ((Get-Variable -Name $name -ValueOnly).IsPresent) { $childArgs += "-$name" }
         }
@@ -866,30 +998,38 @@ function Start-Main {
         return
     }
 
-    # 2) Partie utilisateur : Fedora, Terminal, PowerShell, apparence.
-    Install-Fedora
-    $user = Initialize-Fedora
-    Set-TerminalIntegration
-    Set-PowerShellIntegration
-    Register-RpmHandler
-    Set-WslResources
-    if (-not $NoSlim) { Invoke-UserSlimming }
-    if (-not $NoLook) { Set-GnomeLook }
-    Save-Backup $script:UserBackup
-
-    # WSL refuse qu'une session administrateur et une session normale tournent en même temps.
-    if (Test-Admin) { Invoke-Native 'wsl.exe' @('--shutdown') | Out-Null }
+    # 2) Partie utilisateur : Fedora, apparence, Terminal, PowerShell.
+    try {
+        Install-Fedora
+        $user = Initialize-Fedora
+        if (-not $NoLook) { Set-GnomeLook }       # avant le Terminal : il a besoin de la police
+        Set-TerminalIntegration
+        Set-PowerShellIntegration
+        Register-RpmHandler
+        Set-WslResources
+        if (-not $NoSlim) { Invoke-UserSlimming }
+    } finally {
+        # Écrite même en cas d'erreur, pour que -Restore puisse tout défaire.
+        Save-Backup $script:UserBackup
+        # WSL refuse qu'une session administrateur et une session normale tournent en même temps.
+        if (Test-Admin) { Invoke-Native 'wsl.exe' @('--shutdown') | Out-Null }
+    }
     Show-Summary $user
 }
 
 # Le script peut être chargé (« . .\setup.ps1 ») sans rien lancer, pour les tests.
 if ($MyInvocation.InvocationName -ne '.') {
+    $exitCode = 0
     try {
         Start-Main
     } catch {
         Write-Host ''
         Write-Host "Erreur : $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host 'Rien n''est perdu : corrige le problème puis relance installer.cmd.' -ForegroundColor Red
-        exit 1
+        Write-Host "Rien n'est perdu : corrige le problème puis relance installer.cmd (dans $($script:Here))." -ForegroundColor Red
+        $exitCode = 1
+    } finally {
+        # Après le redémarrage, la fenêtre s'ouvre toute seule : on la laisse ouverte pour lire.
+        if ($Resume -and -not $AdminPhase) { Read-Host 'Appuie sur Entrée pour fermer' | Out-Null }
     }
+    exit $exitCode
 }

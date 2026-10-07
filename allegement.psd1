@@ -58,6 +58,13 @@
         @{ Name = 'Microsoft.549981C3F5F10';               Label = 'Cortana' }
     )
 
+    # Stratégies de ton compte : seul un administrateur peut les écrire (appliquées par la
+    # partie administrateur, uniquement si c'est bien ton compte).
+    AdminUserRegistry = @(
+        @{ Path = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'; Name = 'DisableSearchBoxSuggestions'; Value = 1; Kind = 'DWord'
+           Label = 'Recherche Windows : plus de résultats web' }
+    )
+
     # Réglages de ton compte : publicités, suggestions, recherche web, enregistrement en fond.
     UserRegistry = @(
         @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo'; Name = 'Enabled'; Value = 0; Kind = 'DWord'
@@ -94,8 +101,6 @@
            Label = 'Bouton Copilot masqué' }
         @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement'; Name = 'ScoobeSystemSettingEnabled'; Value = 0; Kind = 'DWord'
            Label = 'Plus d''écran « terminons la configuration de votre appareil »' }
-        @{ Path = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'; Name = 'DisableSearchBoxSuggestions'; Value = 1; Kind = 'DWord'
-           Label = 'Recherche Windows : plus de résultats web' }
         @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR'; Name = 'HistoricalCaptureEnabled'; Value = 0; Kind = 'DWord'
            Label = 'Pas d''enregistrement vidéo en continu pendant les jeux' }
         @{ Path = 'HKCU:\Software\Microsoft\Siuf\Rules'; Name = 'NumberOfSIUFInPeriod'; Value = 0; Kind = 'DWord'
