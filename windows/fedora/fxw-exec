@@ -1,0 +1,21 @@
+#!/usr/bin/bash
+# fxw-exec <commande> [arguments...] : lance une commande Fedora appelée depuis PowerShell.
+#  - les chemins Windows (C:\Users\..., \\serveur\...) deviennent des chemins Linux ;
+#  - les jokers (*.txt, photo?.png) sont développés comme le ferait bash.
+args=()
+first=1
+for a in "$@"; do
+    if [[ "$a" =~ ^[A-Za-z]:[\\/] || "$a" == \\\\* ]]; then
+        a="$(wslpath -u "$a" 2>/dev/null || printf '%s' "$a")"
+    fi
+    if ((!first)) && [[ "$a" != -* && "$a" == *[*?[]* ]]; then
+        mapfile -t matches < <(compgen -G "$a")
+        if ((${#matches[@]})); then
+            args+=("${matches[@]}")
+            continue
+        fi
+    fi
+    args+=("$a")
+    first=0
+done
+exec "${args[@]}"

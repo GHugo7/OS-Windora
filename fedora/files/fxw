@@ -1,0 +1,830 @@
+#!/usr/bin/env bash
+# fxw - lance les programmes Windows (.exe, .msi, .bat, .lnk) sous Fedora.
+#
+# Moteur "proton" (par défaut si umu-run est installé) : Proton de Valve, via umu-launcher,
+# le même que Steam utilise pour les jeux. Moteur "wine" : le Wine de Fedora.
+# Chaque "préfixe" est un faux C:\ indépendant, rangé dans ~/Games/FXW/prefixes/<nom>.
+
+set -uo pipefail
+
+readonly FXW_VERSION="1.0"
+FXW_BIN="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly FXW_BIN
+
+FXW_HOME="${FXW_HOME:-$HOME/Games/FXW}"
+FXW_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/fxw/fxw.conf"
+FXW_LOGS="${XDG_STATE_HOME:-$HOME/.local/state}/fxw/logs"
+FXW_APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+FXW_ICONS="${XDG_DATA_HOME:-$HOME/.local/share}/icons/fxw"
+
+# Réglages modifiables dans ~/.config/fxw/fxw.conf
+FXW_ENGINE="auto"            # auto | proton | wine
+FXW_PROTON=""                # vide = UMU-Proton ; "GE-Proton" = dernière GE-Proton ; ou un chemin
+FXW_DEFAULT_PREFIX="principal"
+FXW_GAMEMODE="1"             # lance via gamemoderun si disponible
+FXW_HUD="0"                  # affiche MangoHud (FPS, températures)
+FXW_MENU_CATEGORY="Game"     # catégorie des raccourcis créés dans le menu
+FXW_AUTO_SHORTCUTS="1"       # crée les raccourcis du menu après une installation
+
+# shellcheck source=/dev/null
+[[ -f "$FXW_CONFIG" ]] && . "$FXW_CONFIG"
+
+PREFIXES="$FXW_HOME/prefixes"
+WINDOWS_EXT_RE='^(exe|com|scr|msi|bat|cmd|lnk)$'
+
+# ---------------------------------------------------------------- affichage
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+has_display() { [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; }
+
+info() { printf '\033[1;34m::\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
+
+notify() {
+    if has_display && have notify-send; then
+        notify-send --app-name="Windora" --icon=fxw "$1" "${2:-}" 2>/dev/null || true
+    fi
+    info "$1${2:+ - $2}"
+}
+
+# Les boîtes de dialogue interprètent le balisage : un nom comme « Tom & Jerry.exe » le casserait.
+markup_escape() {
+    local t="$1"
+    t="${t//&/&amp;}"
+    t="${t//</&lt;}"
+    printf '%s' "${t//>/&gt;}"
+}
+
+# Message d'erreur : boîte de dialogue si lancé depuis le bureau, texte sinon.
+error_box() {
+    local title="$1" text="$2"
+    printf '\033[1;31mErreur :\033[0m %s\n%s\n' "$title" "$text" >&2
+    if ! [[ -t 2 ]] && has_display; then
+        local mt mx
+        mt="$(markup_escape "$title")"
+        mx="$(markup_escape "$text")"
+        if have kdialog && [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]]; then
+            kdialog --title "Windora" --error "<b>$mt</b><br><br>${mx//$'\n'/<br>}" 2>/dev/null
+        elif have zenity; then
+            zenity --error --title="Windora" --width=480 --text="<b>$mt</b>\n\n$mx" 2>/dev/null
+        elif have notify-send; then
+            notify-send --urgency=critical --app-name="Windora" "$title" "$text"
+        fi
+    fi
+}
+
+die() {
+    error_box "$1" "${2:-}"
+    exit 1
+}
+
+# ---------------------------------------------------------------- moteurs
+
+# umu-run présent ET exécutable (une installation ratée peut laisser un fichier sans droit x).
+have_umu() {
+    local u
+    u="$(command -v umu-run 2>/dev/null)" && [[ -x "$u" ]]
+}
+
+# Affiche le moteur à utiliser. À appeler avec « || exit 1 » : die n'arrête qu'un sous-shell.
+resolve_engine() {
+    local wanted="${1:-$FXW_ENGINE}"
+    case "$wanted" in
+        proton)
+            have_umu || die "umu-run est introuvable" "Installez umu-launcher (install.sh le fait) ou utilisez --wine."
+            echo proton ;;
+        wine)
+            have wine || die "wine est introuvable" "Installez-le avec : sudo dnf install wine"
+            echo wine ;;
+        auto | "")
+            if have_umu; then echo proton
+            elif have wine; then echo wine
+            else die "Aucun moteur Windows installé" "Lancez install.sh, ou : sudo dnf install wine"
+            fi ;;
+        *) die "Moteur inconnu : $wanted" "Valeurs possibles : auto, proton, wine." ;;
+    esac
+}
+
+# Variables d'environnement communes aux deux moteurs pour un préfixe donné.
+prefix_env() {
+    local prefix="$1" engine="$2"
+    ENV_VARS=("WINEPREFIX=$prefix")
+    # Les raccourcis du menu sont gérés par fxw (pour passer par le bon moteur).
+    ENV_VARS+=("WINEDLLOVERRIDES=winemenubuilder.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}")
+    if [[ "$engine" == proton ]]; then
+        ENV_VARS+=("GAMEID=${FXW_GAMEID:-${GAMEID:-umu-default}}")
+        [[ -n "$FXW_PROTON" ]] && ENV_VARS+=("PROTONPATH=$FXW_PROTON")
+    else
+        ENV_VARS+=("WINEDEBUG=${WINEDEBUG:--all}")
+    fi
+}
+
+# Lance une commande Windows dans un préfixe : engine_exec <préfixe> <moteur> <args...>
+engine_exec() {
+    local prefix="$1" engine="$2"
+    shift 2
+    prefix_env "$prefix" "$engine"
+    local runner=()
+    if [[ "$FXW_GAMEMODE" == 1 ]] && have gamemoderun; then runner+=(gamemoderun); fi
+    if [[ "$FXW_HUD" == 1 ]] && have mangohud; then runner+=(mangohud); fi
+    if [[ "$engine" == proton ]]; then
+        env "${ENV_VARS[@]}" "${runner[@]}" umu-run "$@"
+    else
+        env "${ENV_VARS[@]}" "${runner[@]}" wine "$@"
+    fi
+}
+
+# ---------------------------------------------------------------- préfixes
+
+valid_prefix_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ && "$1" != . && "$1" != .. ]]; }
+
+# Si le fichier est rangé dans un préfixe fxw, renvoie le nom de ce préfixe.
+prefix_of_path() {
+    local path="$1" p real
+    for p in "$PREFIXES"/*/; do
+        [[ -d "$p" ]] || continue
+        p="${p%/}"
+        real="$(readlink -f -- "$p")"
+        if [[ "$path" == "$real"/* || "$path" == "$p"/* ]]; then
+            basename -- "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+prefix_engine() {
+    local f="$1/.fxw-engine"
+    [[ -f "$f" ]] && cat -- "$f"
+}
+
+# Prépare un préfixe et choisit son moteur. Résultat dans PREFIX et ENGINE.
+open_prefix() {
+    local name="$1" wanted="$2"
+    valid_prefix_name "$name" || die "Nom de préfixe invalide : $name" "Lettres, chiffres, '.', '_' et '-' seulement."
+    PREFIX="$PREFIXES/$name"
+    local stored
+    stored="$(prefix_engine "$PREFIX")"
+    if [[ -n "$stored" && -z "$wanted" ]]; then
+        # Un préfixe garde toujours le moteur qui l'a créé : mélanger Wine et Proton l'abîme.
+        ENGINE="$(resolve_engine "$stored")" || exit 1
+    else
+        ENGINE="$(resolve_engine "$wanted")" || exit 1
+        if [[ -n "$stored" && "$stored" != "$ENGINE" ]]; then
+            warn "Le préfixe « $name » a été créé avec $stored ; il est lancé avec $ENGINE à votre demande."
+        fi
+    fi
+    if [[ ! -d "$PREFIX" ]]; then
+        mkdir -p -- "$PREFIX"
+        echo "$ENGINE" >"$PREFIX/.fxw-engine"
+        notify "Préparation de Windows ($ENGINE)" \
+            "Premier lancement du préfixe « $name » : cela peut prendre quelques minutes."
+    elif [[ -z "$stored" ]]; then
+        echo "$ENGINE" >"$PREFIX/.fxw-engine"
+    fi
+}
+
+# ---------------------------------------------------------------- raccourcis .lnk
+
+# Lit un raccourci Windows (.lnk). Affiche, séparés par des octets nuls : la cible, le dossier
+# de travail, puis chaque argument (découpés selon les règles de Windows). Rien si illisible.
+lnk_read() {
+    timeout 10 python3 - "$1" <<'PY'
+import os
+import struct
+import sys
+
+
+def split_args(s):
+    """Découpe une ligne de commande comme CommandLineToArgvW."""
+    args, i, n = [], 0, len(s)
+    while True:
+        while i < n and s[i] in " \t":
+            i += 1
+        if i >= n:
+            return args
+        cur, quoted = [], False
+        while i < n and (quoted or s[i] not in " \t"):
+            if s[i] == "\\":
+                j = i
+                while j < n and s[j] == "\\":
+                    j += 1
+                if j < n and s[j] == '"':
+                    cur.append("\\" * ((j - i) // 2))
+                    if (j - i) % 2:
+                        cur.append('"')
+                        j += 1
+                    i = j
+                else:
+                    cur.append("\\" * (j - i))
+                    i = j
+            elif s[i] == '"':
+                if quoted and i + 1 < n and s[i + 1] == '"':
+                    cur.append('"')
+                    i += 2
+                else:
+                    quoted = not quoted
+                    i += 1
+            else:
+                cur.append(s[i])
+                i += 1
+        args.append("".join(cur))
+
+
+def main(path):
+    data = open(path, "rb").read()
+    if len(data) < 0x4C or struct.unpack_from("<I", data, 0)[0] != 0x4C:
+        return 1
+    flags = struct.unpack_from("<I", data, 0x14)[0]
+    pos = 0x4C
+    if flags & 0x01:                                   # HasLinkTargetIDList
+        pos += 2 + struct.unpack_from("<H", data, pos)[0]
+    target = ""
+    if flags & 0x02:                                   # HasLinkInfo
+        start = pos
+        size, hsize, li_flags, _vol, base_off, _net, suffix_off = struct.unpack_from("<7I", data, pos)
+
+        def cstr(off, wide=False):
+            if wide:
+                end = off
+                while end + 1 < len(data) and data[end:end + 2] != b"\0\0":
+                    end += 2
+                if end + 1 >= len(data):
+                    raise ValueError("chaîne non terminée")
+                return data[off:end].decode("utf-16-le", "replace")
+            end = data.index(b"\0", off)
+            return data[off:end].decode("cp1252", "replace")
+
+        if li_flags & 0x01:                            # VolumeIDAndLocalBasePath
+            base_u = struct.unpack_from("<I", data, start + 0x1C)[0] if hsize >= 0x24 else 0
+            target = cstr(start + base_u, wide=True) if base_u else cstr(start + base_off)
+            target += cstr(start + suffix_off)
+        pos = start + size
+
+    unicode = bool(flags & 0x80)
+    strings = {}
+    for bit, key in ((0x04, "name"), (0x08, "relpath"), (0x10, "workdir"), (0x20, "args"), (0x40, "icon")):
+        if flags & bit:
+            count = struct.unpack_from("<H", data, pos)[0]
+            pos += 2
+            n = count * (2 if unicode else 1)
+            if pos + n > len(data):
+                raise ValueError("raccourci tronqué")
+            text = data[pos:pos + n].decode("utf-16-le" if unicode else "cp1252", "replace")
+            # Certains outils (dont Wine) comptent le caractère nul final dans la longueur.
+            strings[key] = text.split("\0", 1)[0]
+            pos += n
+
+    target = target.split("\0", 1)[0]
+    if not target and strings.get("relpath"):
+        # Chemin relatif : il part du dossier du raccourci.
+        rel = strings["relpath"].replace("\\", "/")
+        target = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(path)), rel))
+    if not target:
+        return 1
+    fields = [target, strings.get("workdir", "")] + split_args(strings.get("args", ""))
+    sys.stdout.write("\0".join(fields) + "\0")
+    return 0
+
+
+try:
+    sys.exit(main(sys.argv[1]))
+except (struct.error, ValueError, IndexError, OSError):
+    sys.exit(1)
+PY
+}
+
+# Cible d'un raccourci (premier champ de lnk_read).
+lnk_target() {
+    local fields=()
+    mapfile -d '' -t fields < <(lnk_read "$1" 2>/dev/null)
+    ((${#fields[@]})) && printf '%s' "${fields[0]}"
+}
+
+# Convertit un chemin Windows (C:\...) en chemin Linux dans le préfixe.
+win_to_unix() {
+    local prefix="$1" win="$2"
+    win="${win//\\//}"
+    if [[ "$win" =~ ^([A-Za-z]):/(.*)$ ]]; then
+        local letter="${BASH_REMATCH[1],,}" rest="${BASH_REMATCH[2]}" root
+        root="$(readlink -f -- "$prefix/dosdevices/$letter:" 2>/dev/null)"
+        [[ -z "$root" && "$letter" == c ]] && root="$prefix/drive_c"
+        echo "${root%/}/$rest"
+    else
+        echo "$win"
+    fi
+}
+
+# Recherche insensible à la casse (Windows ne distingue pas les majuscules).
+fix_case() {
+    local path="$1"
+    [[ -e "$path" ]] && { echo "$path"; return; }
+    local dir="" part entry base found
+    IFS='/' read -r -a parts <<<"${path#/}"
+    for part in "${parts[@]}"; do
+        [[ -z "$part" ]] && continue
+        found=""
+        for entry in "$dir"/* "$dir"/.*; do
+            base="${entry##*/}"
+            if [[ "${base,,}" == "${part,,}" ]]; then
+                found="$entry"
+                break
+            fi
+        done
+        [[ -n "$found" ]] || { echo "$path"; return; }
+        dir="$found"
+    done
+    echo "${dir:-/}"
+}
+
+# Tous les raccourcis Windows d'un préfixe (bureau et menu Démarrer).
+list_lnks() {
+    local prefix="$1"
+    [[ -d "$prefix/drive_c" ]] || return 0
+    local dirs=("$prefix/drive_c/ProgramData/Microsoft/Windows/Start Menu")
+    local d
+    for d in "$prefix/drive_c/users/"*; do
+        [[ -d "$d" ]] || continue
+        dirs+=("$d/Desktop" "$d/AppData/Roaming/Microsoft/Windows/Start Menu")
+    done
+    # -H : suit les dossiers de départ qui sont des liens (Wine relie Desktop à ~/Bureau).
+    find -H "${dirs[@]}" -iname '*.lnk' -type f 2>/dev/null | sort -u
+}
+
+# Court identifiant stable d'une chaîne (évite les collisions entre noms non latins).
+short_hash() { printf '%s' "$1" | sha1sum | cut -c1-8; }
+
+slugify() {
+    local s="${1,,}"
+    s="$(printf '%s' "$s" | iconv -f utf-8 -t ascii//TRANSLIT 2>/dev/null || printf '%s' "$s")"
+    s="$(printf '%s' "$s" | tr -cs 'a-z0-9' '-')"
+    s="${s#-}"
+    s="${s%-}"
+    echo "${s:-programme}"
+}
+
+# Échappe un argument pour la ligne Exec= d'un fichier .desktop.
+desktop_quote() {
+    local s="$1"
+    s="${s//\\/\\\\\\\\}"
+    s="${s//\"/\\\\\"}"
+    s="${s//\`/\\\\\`}"
+    s="${s//\$/\\\\\$}"
+    s="${s//%/%%}"
+    printf '"%s"' "$s"
+}
+
+# Extrait la plus grande icône d'un .exe (icoutils), renvoie le chemin du PNG ou "fxw".
+extract_icon() {
+    local exe="$1" slug="$2"
+    if have wrestool && have icotool && [[ -f "$exe" ]]; then
+        local tmp
+        tmp="$(mktemp -d)"
+        if wrestool -x -t 14 -- "$exe" >"$tmp/icon.ico" 2>/dev/null && [[ -s "$tmp/icon.ico" ]] &&
+            icotool -x -o "$tmp" -- "$tmp/icon.ico" 2>/dev/null; then
+            local best
+            best="$(find "$tmp" -name '*.png' -printf '%s %p\n' | sort -n | tail -n1 | cut -d' ' -f2-)"
+            if [[ -n "$best" ]]; then
+                mkdir -p -- "$FXW_ICONS"
+                cp -- "$best" "$FXW_ICONS/$slug.png"
+                rm -rf -- "$tmp"
+                echo "$FXW_ICONS/$slug.png"
+                return
+            fi
+        fi
+        rm -rf -- "$tmp"
+    fi
+    echo fxw
+}
+
+# Crée une entrée dans le menu des applications :
+#   make_shortcut <préfixe> <fichier> <nom> [cible pour l'icône] [options de fxw run...]
+make_shortcut() {
+    local prefix_name="$1" file="$2" name="$3" icon_src="${4:-$2}"
+    shift 4 2>/dev/null || shift $#
+    local slug desktop icon opt exec_opts=""
+    # Un nom ou un chemin contenant un retour à la ligne pourrait ajouter des lignes au
+    # fichier .desktop (par exemple une autre commande Exec=) : on refuse.
+    if [[ "$file$prefix_name" == *[[:cntrl:]]* ]]; then
+        warn "Raccourci ignoré : chemin contenant des caractères de contrôle ($file)"
+        return 0
+    fi
+    name="${name//[[:cntrl:]]/ }"
+    slug="$(slugify "$prefix_name-$name")-$(short_hash "$prefix_name/$file")"
+    desktop="$FXW_APPS/fxw-$slug.desktop"
+    for opt in "$@"; do exec_opts+=" $(desktop_quote "$opt")"; done
+    icon="$(extract_icon "$icon_src" "$slug")"
+    mkdir -p -- "$FXW_APPS"
+    cat >"$desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$name
+Comment=Programme Windows (préfixe $prefix_name)
+Exec=$(desktop_quote "$FXW_BIN") run --prefix $(desktop_quote "$prefix_name")$exec_opts $(desktop_quote "$file")
+Icon=$icon
+Terminal=false
+Categories=$FXW_MENU_CATEGORY;
+X-FXW-Prefix=$prefix_name
+EOF
+    have update-desktop-database && update-desktop-database "$FXW_APPS" 2>/dev/null
+    info "Raccourci ajouté au menu : $name"
+}
+
+# Après une installation : un raccourci de menu pour chaque nouveau .lnk créé par l'installeur.
+shortcuts_from_new_lnks() {
+    local prefix_name="$1" before="$2" after lnk
+    after="$(list_lnks "$PREFIXES/$prefix_name")"
+    local count=0 seen=" "
+    while IFS= read -r lnk; do
+        [[ -z "$lnk" ]] && continue
+        grep -Fxq -- "$lnk" <<<"$before" && continue
+        local name target key
+        name="$(basename -- "$lnk")"
+        name="${name%.*}"
+        target="$(lnk_target "$lnk")"
+        # Le même programme a souvent un raccourci dans le menu Démarrer ET sur le bureau.
+        key="$(short_hash "${target,,}|${name,,}")"
+        [[ "$seen" == *" $key "* ]] && continue
+        # On ignore les désinstalleurs, les liens vers des sites et les documents.
+        [[ "${name,,}" == *uninstall* || "${name,,}" == *désinstaller* ]] && continue
+        [[ "${target,,}" =~ unins[^/\\]*\.exe$ ]] && continue
+        [[ -n "$target" && ! "${target,,}" =~ \.(exe|bat|cmd|com)$ ]] && continue
+        local icon_src=""
+        [[ -n "$target" ]] && icon_src="$(fix_case "$(win_to_unix "$PREFIXES/$prefix_name" "$target")")"
+        make_shortcut "$prefix_name" "$lnk" "$name" "$icon_src"
+        seen+="$key "
+        count=$((count + 1))
+    done <<<"$after"
+    ((count > 0)) && notify "Installation terminée" "$count raccourci(s) ajouté(s) au menu des applications."
+    return 0
+}
+
+# ---------------------------------------------------------------- commandes
+
+usage() {
+    cat <<EOF
+fxw $FXW_VERSION - lance les programmes Windows sous Fedora
+
+Utilisation :
+  fxw [options] <fichier.exe|.msi|.bat|.lnk> [arguments...]
+  fxw <commande> [...]
+
+Commandes :
+  run [options] <fichier> [args]  lance un programme Windows (commande par défaut)
+  menu [options] <fichier> [nom]  ajoute un programme au menu des applications
+  config [préfixe]                réglages Windows du préfixe (winecfg)
+  tricks [--prefix P] <verbes>    installe des composants (winetricks : vcrun2022, dotnet48...)
+  list                            liste les préfixes
+  remove <préfixe>                supprime un préfixe et ses raccourcis
+  prepare [préfixe]               prépare un préfixe à l'avance (télécharge Proton)
+  windows                         redémarre une fois sous Windows (double démarrage)
+  doctor                          vérifie l'installation (pilotes, Vulkan, Proton...)
+  version | help
+
+Options de lancement :
+  --proton | --wine     choisit le moteur (sinon : celui du préfixe, ou $FXW_ENGINE)
+  --prefix NOM          préfixe à utiliser (défaut : $FXW_DEFAULT_PREFIX)
+  --isolated            préfixe séparé, nommé d'après le programme
+  --hud                 affiche MangoHud (FPS)
+  --no-gamemode         n'utilise pas GameMode
+
+Préfixes : $PREFIXES
+Réglages : $FXW_CONFIG
+EOF
+}
+
+# Lit les options communes. Remplit OPT_ENGINE, OPT_PREFIX, OPT_ISOLATED et ARGS.
+parse_run_options() {
+    OPT_ENGINE=""
+    OPT_PREFIX=""
+    OPT_ISOLATED=0
+    OPT_EXTRA=()       # options à recopier dans un raccourci (fxw menu)
+    ARGS=()
+    while (($#)); do
+        case "$1" in
+            --proton) OPT_ENGINE=proton; OPT_EXTRA+=(--proton) ;;
+            --wine) OPT_ENGINE=wine; OPT_EXTRA+=(--wine) ;;
+            --prefix)
+                [[ $# -ge 2 ]] || die "--prefix demande un nom"
+                OPT_PREFIX="$2"
+                shift ;;
+            --prefix=*) OPT_PREFIX="${1#*=}" ;;
+            --isolated) OPT_ISOLATED=1 ;;
+            --hud) FXW_HUD=1; OPT_EXTRA+=(--hud) ;;
+            --no-gamemode) FXW_GAMEMODE=0; OPT_EXTRA+=(--no-gamemode) ;;
+            --) shift; ARGS+=("$@"); return ;;
+            -*) die "Option inconnue : $1" "Voir : fxw help" ;;
+            *) ARGS+=("$@"); return ;;
+        esac
+        shift
+    done
+}
+
+# Préfixe qui contient la cible Windows d'un raccourci (C:\...), s'il y en a un.
+prefix_for_target() {
+    local target="$1" p
+    for p in "$PREFIXES"/*/; do
+        [[ -d "$p" ]] || continue
+        p="${p%/}"
+        if [[ -f "$(fix_case "$(win_to_unix "$p" "$target")")" ]]; then
+            basename -- "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Choisit le préfixe d'un fichier : celui qui le contient, sinon --prefix, sinon le défaut.
+choose_prefix() {
+    local file="$1" name
+    if name="$(prefix_of_path "$file")"; then
+        echo "$name"
+    elif [[ -n "$OPT_PREFIX" ]]; then
+        echo "$OPT_PREFIX"
+    elif ((OPT_ISOLATED)); then
+        local base slug
+        base="$(basename -- "$file")"
+        slug="$(slugify "${base%.*}")"
+        # Nom illisible (ex. caractères chinois) : on ajoute un identifiant tiré du chemin.
+        [[ "$slug" == programme ]] && slug="programme-$(short_hash "$file")"
+        echo "$slug"
+    else
+        echo "$FXW_DEFAULT_PREFIX"
+    fi
+}
+
+cmd_run() {
+    parse_run_options "$@"
+    ((${#ARGS[@]})) || die "Aucun fichier à lancer" "Utilisation : fxw run <fichier.exe>"
+    local file
+    file="$(readlink -f -- "${ARGS[0]}")"
+    [[ -f "$file" ]] || die "Fichier introuvable : ${ARGS[0]}"
+    local ext="${file##*.}"
+    ext="${ext,,}"
+    [[ "$ext" =~ $WINDOWS_EXT_RE ]] || die "Ce n'est pas un programme Windows : $(basename -- "$file")" \
+        "Extensions prises en charge : .exe .msi .bat .cmd .com .lnk"
+
+    # Un raccourci est suivi jusqu'au vrai programme (plus fiable que « start » sous Proton).
+    local lnk_fields=() target="" workdir=""
+    if [[ "$ext" == lnk ]]; then
+        mapfile -d '' -t lnk_fields < <(lnk_read "$file" 2>/dev/null)
+        ((${#lnk_fields[@]} >= 2)) || die "Raccourci illisible : $(basename -- "$file")"
+        target="${lnk_fields[0]}"
+        workdir="${lnk_fields[1]}"
+    fi
+
+    local prefix_name
+    if [[ -n "$target" && -z "$OPT_PREFIX" ]] && ! prefix_of_path "$file" >/dev/null; then
+        # Raccourci posé hors d'un préfixe (ex. sur le bureau) : le préfixe qui contient sa cible.
+        prefix_name="$(prefix_for_target "$target")" || prefix_name="$(choose_prefix "$file")"
+    else
+        prefix_name="$(choose_prefix "$file")"
+    fi
+    open_prefix "$prefix_name" "$OPT_ENGINE"
+
+    local cmd=() rundir
+    rundir="$(dirname -- "$file")"
+    case "$ext" in
+        msi) cmd=(msiexec /i "$file") ;;
+        bat | cmd) cmd=(cmd /c "$file") ;;
+        lnk)
+            target="$(fix_case "$(win_to_unix "$PREFIX" "$target")")"
+            [[ -f "$target" ]] || die "Le programme visé par ce raccourci est introuvable" "$target"
+            [[ -n "$workdir" ]] && workdir="$(fix_case "$(win_to_unix "$PREFIX" "$workdir")")"
+            cmd=("$target" "${lnk_fields[@]:2}")
+            rundir="$(dirname -- "$target")"
+            [[ -d "$workdir" ]] && rundir="$workdir" ;;
+        *) cmd=("$file") ;;
+    esac
+    cmd+=("${ARGS[@]:1}")
+
+    # Beaucoup de jeux s'attendent à être lancés depuis leur propre dossier.
+    cd -- "$rundir" || die "Dossier inaccessible : $rundir"
+
+    mkdir -p -- "$FXW_LOGS"
+    local log
+    log="$FXW_LOGS/$(slugify "$(basename -- "$file")").log"
+    local lnks_before=""
+    [[ "$FXW_AUTO_SHORTCUTS" == 1 ]] && lnks_before="$(list_lnks "$PREFIX")"
+
+    {
+        echo "=== $(date '+%F %T') : $file"
+        echo "=== préfixe $prefix_name ($ENGINE)"
+    } >>"$log"
+    info "Lancement de $(basename -- "$file") (préfixe « $prefix_name », $ENGINE)"
+
+    local start status
+    start="$(date +%s)"
+    if [[ -t 1 ]]; then
+        # Dans un terminal : sortie directe (un tube casserait les programmes interactifs).
+        echo "=== (sortie affichée dans le terminal)" >>"$log"
+        engine_exec "$PREFIX" "$ENGINE" "${cmd[@]}"
+        status=$?
+    else
+        engine_exec "$PREFIX" "$ENGINE" "${cmd[@]}" >>"$log" 2>&1
+        status=$?
+    fi
+    echo "=== code de sortie $status" >>"$log"
+
+    [[ "$FXW_AUTO_SHORTCUTS" == 1 ]] && shortcuts_from_new_lnks "$prefix_name" "$lnks_before"
+
+    # Un programme qui s'arrête en erreur presque tout de suite n'a sans doute pas démarré.
+    if ((status != 0 && $(date +%s) - start < 20)); then
+        error_box "$(basename -- "$file") s'est arrêté (code $status)" \
+"Journal : $log
+
+Pistes :
+- jeu en ligne avec anti-triche noyau (Vanguard, Ricochet...) : impossible sous Linux ;
+- essayez l'autre moteur : fxw run --wine (ou --proton) ;
+- composants manquants : fxw tricks vcrun2022 ;
+- consultez protondb.com pour ce jeu."
+    fi
+    return "$status"
+}
+
+cmd_menu() {
+    parse_run_options "$@"
+    ((${#ARGS[@]})) || die "Utilisation : fxw menu <fichier.exe> [nom]"
+    local file
+    file="$(readlink -f -- "${ARGS[0]}")"
+    [[ -f "$file" ]] || die "Fichier introuvable : ${ARGS[0]}"
+    local name="${ARGS[1]:-}"
+    if [[ -z "$name" ]]; then
+        name="$(basename -- "$file")"
+        name="${name%.*}"
+    fi
+    local prefix_name
+    prefix_name="$(choose_prefix "$file")"
+    valid_prefix_name "$prefix_name" || die "Nom de préfixe invalide : $prefix_name"
+    make_shortcut "$prefix_name" "$file" "$name" "$file" "${OPT_EXTRA[@]}"
+}
+
+cmd_config() {
+    local name="${1:-$FXW_DEFAULT_PREFIX}"
+    open_prefix "$name" ""
+    engine_exec "$PREFIX" "$ENGINE" winecfg
+}
+
+cmd_tricks() {
+    parse_run_options "$@"
+    ((${#ARGS[@]})) || die "Utilisation : fxw tricks [--prefix P] <verbes...>" "Exemple : fxw tricks vcrun2022 d3dcompiler_47"
+    open_prefix "${OPT_PREFIX:-$FXW_DEFAULT_PREFIX}" "$OPT_ENGINE"
+    if [[ "$ENGINE" == proton ]]; then
+        engine_exec "$PREFIX" proton winetricks -q "${ARGS[@]}"
+    else
+        have winetricks || die "winetricks est introuvable" "sudo dnf install winetricks"
+        prefix_env "$PREFIX" wine
+        env "${ENV_VARS[@]}" winetricks -q "${ARGS[@]}"
+    fi
+}
+
+cmd_list() {
+    if [[ ! -d "$PREFIXES" ]] || [[ -z "$(ls -A -- "$PREFIXES" 2>/dev/null)" ]]; then
+        echo "Aucun préfixe pour l'instant. Lancez un .exe pour créer « $FXW_DEFAULT_PREFIX »."
+        return
+    fi
+    local p
+    printf '%-24s %-8s %s\n' PRÉFIXE MOTEUR TAILLE
+    for p in "$PREFIXES"/*/; do
+        p="${p%/}"
+        printf '%-24s %-8s %s\n' "$(basename -- "$p")" "$(prefix_engine "$p" || echo '?')" \
+            "$(du -sh -- "$p" 2>/dev/null | cut -f1)"
+    done
+}
+
+cmd_remove() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "Utilisation : fxw remove <préfixe>"
+    valid_prefix_name "$name" || die "Nom de préfixe invalide : $name"
+    [[ -d "$PREFIXES/$name" ]] || die "Préfixe introuvable : $name"
+    if [[ -t 0 ]]; then
+        read -r -p "Supprimer « $name » et tous les programmes installés dedans ? [o/N] " answer
+        [[ "${answer,,}" == o* ]] || { echo "Annulé."; return; }
+    fi
+    rm -rf -- "${PREFIXES:?}/$name"
+    grep -lxF -- "X-FXW-Prefix=$name" "$FXW_APPS"/fxw-*.desktop 2>/dev/null | while IFS= read -r f; do
+        rm -f -- "$f"
+    done
+    have update-desktop-database && update-desktop-database "$FXW_APPS" 2>/dev/null
+    info "Préfixe « $name » supprimé."
+}
+
+cmd_prepare() {
+    local name="${1:-$FXW_DEFAULT_PREFIX}"
+    open_prefix "$name" ""
+    info "Préparation de « $name » ($ENGINE)... (le premier téléchargement de Proton peut être long)"
+    engine_exec "$PREFIX" "$ENGINE" wineboot -u && info "Prêt."
+}
+
+# Redémarrage ponctuel sous Windows, via l'entrée UEFI « Windows Boot Manager ».
+cmd_windows() {
+    have efibootmgr || die "efibootmgr est introuvable" "sudo dnf install efibootmgr"
+    [[ -d /sys/firmware/efi ]] || die "Ce PC ne démarre pas en mode UEFI" \
+        "Choisissez Windows dans le menu de démarrage (GRUB) au prochain redémarrage."
+    local entry
+    entry="$(efibootmgr | sed -nE 's/^Boot([0-9A-Fa-f]{4})\*? +Windows Boot Manager.*/\1/p' | head -n1)"
+    [[ -n "$entry" ]] || die "Windows est introuvable" \
+        "Aucune entrée « Windows Boot Manager » dans le micrologiciel UEFI. Windows est-il installé sur ce PC ?"
+    local question="Redémarrer maintenant sous Windows ?
+
+Enregistrez votre travail. Au redémarrage suivant, Fedora revient automatiquement."
+    if [[ -t 0 ]]; then
+        read -r -p "Redémarrer maintenant sous Windows (une seule fois) ? [o/N] " answer
+        [[ "${answer,,}" == o* ]] || { echo "Annulé."; return; }
+    elif has_display && have kdialog && [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]]; then
+        kdialog --title "Windora" --warningyesno "$question" 2>/dev/null || return 0
+    elif has_display && have zenity; then
+        zenity --question --title="Windora" --no-markup --text="$question" 2>/dev/null || return 0
+    elif has_display && have kdialog; then
+        kdialog --title "Windora" --warningyesno "$question" 2>/dev/null || return 0
+    else
+        die "Confirmation impossible" "Lancez « fxw windows » dans un terminal."
+    fi
+    local elevate=(sudo)
+    [[ -t 0 ]] || elevate=(pkexec)
+    "${elevate[@]}" efibootmgr --bootnext "$entry" >/dev/null || die "Impossible de choisir Windows pour le prochain démarrage"
+    systemctl reboot
+}
+
+cmd_doctor() {
+    local ok=0 bad=0
+    check() {
+        if eval "$2" >/dev/null 2>&1; then
+            printf '  \033[32m✔\033[0m %s\n' "$1"
+            ok=$((ok + 1))
+        else
+            printf '  \033[31m✘\033[0m %s%s\n' "$1" "${3:+  -> $3}"
+            bad=$((bad + 1))
+        fi
+    }
+    # shellcheck source=/dev/null
+    echo "Système : $(. /etc/os-release && echo "$PRETTY_NAME"), noyau $(uname -r)"
+    echo
+    echo "Cartes graphiques :"
+    local dev vendor driver
+    for dev in /sys/bus/pci/devices/*; do
+        [[ "$(cat "$dev/class" 2>/dev/null)" == 0x03* ]] || continue
+        vendor="$(cat "$dev/vendor")"
+        driver="$(basename "$(readlink -f "$dev/driver" 2>/dev/null)" 2>/dev/null)"
+        case "$vendor" in
+            0x10de) vendor=NVIDIA ;;
+            0x1002) vendor=AMD ;;
+            0x8086) vendor=Intel ;;
+        esac
+        echo "  - $vendor (pilote : ${driver:-aucun})"
+        [[ "$vendor" == NVIDIA && "$driver" == nouveau ]] &&
+            echo "    -> pilote libre « nouveau » : installez le pilote NVIDIA (install.sh) pour jouer."
+    done
+    echo
+    echo "Composants :"
+    check "Vulkan fonctionne" "vulkaninfo --summary" "sudo dnf install vulkan-tools ; vérifiez les pilotes"
+    check "Vulkan 32 bits (vieux jeux)" "compgen -G '/usr/share/vulkan/icd.d/*i686*' || compgen -G '/usr/share/vulkan/icd.d/nvidia_icd*'" \
+        "sudo dnf install mesa-vulkan-drivers.i686"
+    check "Proton (umu-run)" "have umu-run" "relancez install.sh"
+    check "Wine" "have wine" "sudo dnf install wine"
+    check "Winetricks" "have winetricks" "sudo dnf install winetricks"
+    check "Steam" "have steam" "sudo dnf install steam"
+    check "GameMode" "have gamemoderun" "sudo dnf install gamemode"
+    check "MangoHud" "have mangohud" "sudo dnf install mangohud"
+    check "Compilateur Windows (MinGW)" "have x86_64-w64-mingw32-gcc" "sudo dnf install mingw64-gcc"
+    check "ntsync (synchronisation rapide)" "test -e /dev/ntsync" "sudo modprobe ntsync"
+    check "Lancement direct ./programme.exe" "grep -qs enabled /proc/sys/fs/binfmt_misc/fxw-exe" \
+        "sudo systemctl restart systemd-binfmt"
+    check ".exe ouverts par fxw au double-clic" \
+        "xdg-mime query default application/vnd.microsoft.portable-executable | grep -q fxw" \
+        "xdg-mime default fxw.desktop application/vnd.microsoft.portable-executable"
+    echo
+    echo "$ok vérification(s) OK, $bad problème(s)."
+    ((bad == 0))
+}
+
+main() {
+    local first="${1:-help}"
+    # "fxw jeu.exe" et l'appel par binfmt_misc ("./jeu.exe") équivalent à "fxw run".
+    if [[ -f "$first" ]]; then
+        local ext="${first##*.}"
+        if [[ "${ext,,}" =~ $WINDOWS_EXT_RE ]]; then
+            cmd_run "$@"
+            exit
+        fi
+    fi
+    shift || true
+    case "$first" in
+        run) cmd_run "$@" ;;
+        menu) cmd_menu "$@" ;;
+        config | winecfg) cmd_config "$@" ;;
+        tricks | winetricks) cmd_tricks "$@" ;;
+        list | ls) cmd_list ;;
+        remove | rm) cmd_remove "$@" ;;
+        prepare) cmd_prepare "$@" ;;
+        windows) cmd_windows ;;
+        doctor) cmd_doctor ;;
+        version | --version) echo "fxw $FXW_VERSION" ;;
+        help | --help | -h) usage ;;
+        -*) cmd_run "$first" "$@" ;;
+        *) die "Commande ou fichier inconnu : $first" "Voir : fxw help" ;;
+    esac
+}
+
+main "$@"

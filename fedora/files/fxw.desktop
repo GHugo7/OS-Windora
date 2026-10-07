@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Programme Windows
+Name[en]=Windows Program
+Comment=Lance les programmes Windows (.exe, .msi) avec Proton ou Wine
+Comment[en]=Run Windows programs (.exe, .msi) with Proton or Wine
+Exec=@BIN@/fxw run %f
+Icon=fxw
+Terminal=false
+NoDisplay=true
+StartupNotify=true
+Categories=Game;Emulator;
+MimeType=application/x-msdownload;application/vnd.microsoft.portable-executable;application/x-ms-dos-executable;application/x-dosexec;application/x-ms-ne-executable;application/x-msi;application/x-ms-shortcut;application/x-bat;

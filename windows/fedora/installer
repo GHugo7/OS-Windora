@@ -1,0 +1,167 @@
+#!/usr/bin/bash
+# installer - installe des logiciels Fedora ET Windows, depuis Fedora (WSL) ou PowerShell.
+#
+#   installer firefox gimp            paquets Fedora (dnf)
+#   installer setup.exe app.msi       installeurs Windows, lancés sur Windows (natif)
+#   installer paquet.rpm              paquet Fedora téléchargé
+#   installer --windows Steam         logiciel Windows via winget
+#   installer firefox Discord.exe     tout mélangé dans une seule commande
+
+set -uo pipefail
+
+PAUSE=0
+FORCE_WINDOWS=0
+FEDORA_PKGS=()
+RPM_FILES=()
+WINDOWS_FILES=()
+WINGET_PKGS=()
+FAILED=0
+
+info() { printf '\033[1;34m::\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
+fail() { printf '\033[1;31mErreur :\033[0m %s\n' "$*" >&2; FAILED=1; }
+
+usage() {
+    cat <<'TXT'
+installer - logiciels Fedora et Windows, avec une seule commande
+
+  installer <nom|fichier>...     installe chaque élément au bon endroit :
+      nom de paquet       -> Fedora (sudo dnf install) ; sinon Windows (winget)
+      fichier .rpm        -> Fedora
+      fichier .exe        -> lancé sur Windows (l'installeur s'ouvre)
+      fichier .msi        -> Windows Installer
+      fichier .msix/.appx -> application Windows (Microsoft Store hors ligne)
+
+  -w, --windows   les noms qui suivent sont des logiciels Windows (winget)
+  -f, --fedora    les noms qui suivent sont des paquets Fedora (par défaut)
+      --pause     attend Entrée à la fin (utilisé par le double-clic sur un .rpm)
+  -h, --help      cette aide
+
+Exemples :
+  installer firefox vlc
+  installer ~/Téléchargements/jeu-setup.exe
+  installer --windows Valve.Steam Discord.Discord
+TXT
+}
+
+finish() {
+    if ((PAUSE)); then
+        echo
+        read -r -p "Appuyez sur Entrée pour fermer..." _ || true
+    fi
+    exit "$FAILED"
+}
+
+# Chemin Windows (C:\...) ou relatif -> chemin Linux.
+to_linux_path() {
+    local p="$1"
+    if [[ "$p" =~ ^[A-Za-z]:[\\/] || "$p" == \\\\* ]]; then
+        wslpath -u "$p" 2>/dev/null || echo "$p"
+    else
+        echo "${p//\\//}"
+    fi
+}
+
+# Un fichier présent dans Fedora (hors /mnt/c...) doit être copié côté Windows pour y être lancé.
+windows_path_for() {
+    local f="$1"
+    case "$(realpath -- "$f")" in
+        /mnt/[a-z]/*) wslpath -w "$f" ;;
+        *)
+            local dir
+            dir="$(wslpath -u "$(cmd.exe /c 'echo %TEMP%' 2>/dev/null | tr -d '\r')")/windora"
+            mkdir -p -- "$dir" && cp -f -- "$f" "$dir/" && wslpath -w "$dir/$(basename -- "$f")"
+            ;;
+    esac
+}
+
+# Échappe une chaîne pour PowerShell entre apostrophes.
+ps_quote() { printf "'%s'" "${1//\'/\'\'}"; }
+
+is_fedora_package() {
+    [[ -n "$(dnf -q repoquery --latest-limit=1 -- "$1" 2>/dev/null)" ]]
+}
+
+classify() {
+    local item="$1" path
+    path="$(to_linux_path "$item")"
+    if [[ -f "$path" ]]; then
+        case "${path,,}" in
+            *.rpm) RPM_FILES+=("$(realpath -- "$path")") ;;
+            *.exe | *.msi | *.msix | *.msixbundle | *.appx | *.appxbundle) WINDOWS_FILES+=("$path") ;;
+            *) fail "type de fichier non pris en charge : $item (.rpm, .exe, .msi, .msix)" ;;
+        esac
+        return
+    fi
+    if [[ "$item" == */* || "$item" == *\\* ]]; then
+        fail "fichier introuvable : $item"
+        return
+    fi
+    if ((FORCE_WINDOWS)); then
+        WINGET_PKGS+=("$item")
+    elif is_fedora_package "$item"; then
+        FEDORA_PKGS+=("$item")
+    else
+        info "« $item » n'existe pas dans Fedora : recherche côté Windows (winget)."
+        WINGET_PKGS+=("$item")
+    fi
+}
+
+install_fedora() {
+    ((${#FEDORA_PKGS[@]} + ${#RPM_FILES[@]})) || return 0
+    info "Fedora : ${FEDORA_PKGS[*]} ${RPM_FILES[*]##*/}"
+    sudo dnf install -y "${FEDORA_PKGS[@]}" "${RPM_FILES[@]}" || fail "l'installation Fedora a échoué"
+}
+
+run_windows_file() {
+    local f="$1" win
+    win="$(windows_path_for "$f")" || { fail "impossible de préparer $f pour Windows"; return; }
+    info "Windows : $(basename -- "$f")"
+    case "${f,,}" in
+        *.exe)
+            # Start-Process -Wait : l'installeur s'ouvre sur le bureau Windows, on attend sa fin.
+            powershell.exe -NoProfile -Command "\$p = Start-Process -FilePath $(ps_quote "$win") -Wait -PassThru; exit \$p.ExitCode" ;;
+        *.msi)
+            # [char]34 = guillemet : évite d'en faire passer un vrai par la ligne de commande Windows.
+            powershell.exe -NoProfile -Command "\$p = Start-Process msiexec.exe -ArgumentList '/i', ([char]34 + $(ps_quote "$win") + [char]34) -Wait -PassThru; exit \$p.ExitCode" ;;
+        *)
+            powershell.exe -NoProfile -Command "Add-AppxPackage -Path $(ps_quote "$win")" ;;
+    esac
+    local status=$?
+    ((status == 0 || status == 3010)) || fail "$(basename -- "$f") s'est terminé avec le code $status"
+    ((status == 3010)) && warn "Windows doit redémarrer pour terminer l'installation de $(basename -- "$f")."
+    return 0
+}
+
+install_winget() {
+    local pkg
+    for pkg in "${WINGET_PKGS[@]}"; do
+        info "Windows (winget) : $pkg"
+        powershell.exe -NoProfile -Command "winget install $(ps_quote "$pkg") --source winget --accept-package-agreements --accept-source-agreements; exit \$LASTEXITCODE" ||
+            fail "winget n'a pas pu installer « $pkg » (essayez : winget search $pkg)"
+    done
+}
+
+main() {
+    (($#)) || { usage; exit 1; }
+    while (($#)); do
+        case "$1" in
+            -h | --help) usage; exit 0 ;;
+            -w | --windows) FORCE_WINDOWS=1 ;;
+            -f | --fedora) FORCE_WINDOWS=0 ;;
+            --pause) PAUSE=1 ;;
+            --) shift; for a in "$@"; do classify "$a"; done; break ;;
+            -*) fail "option inconnue : $1"; finish ;;
+            *) classify "$1" ;;
+        esac
+        shift
+    done
+    install_fedora
+    local f
+    for f in "${WINDOWS_FILES[@]}"; do run_windows_file "$f"; done
+    install_winget
+    ((FAILED)) || info "Terminé."
+    finish
+}
+
+main "$@"

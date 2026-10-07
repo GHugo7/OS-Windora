@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Redémarrer sous Windows
+Name[en]=Reboot to Windows
+Comment=Redémarre une seule fois sous Windows (pour les jeux avec anti-triche noyau)
+Comment[en]=Reboot once into Windows (for games with kernel anti-cheat)
+Exec=@BIN@/fxw windows
+Icon=system-reboot
+Terminal=false
+Categories=System;
+Keywords=windows;valorant;dual;boot;reboot;

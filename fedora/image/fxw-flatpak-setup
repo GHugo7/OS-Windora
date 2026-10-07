@@ -1,0 +1,24 @@
+#!/usr/bin/bash
+# Premier démarrage : installe les applications Flathub (impossible pendant la construction
+# de l'image, car /var n'est pas conservé).
+set -euo pipefail
+
+STAMP=/var/lib/fxw/flatpak-setup-done
+APPS=(
+    com.heroicgameslauncher.hgl
+    com.usebottles.bottles
+    com.vysp3r.ProtonPlus
+    com.github.tchx84.Flatseal
+)
+
+[[ -f "$STAMP" ]] && exit 0
+flatpak remote-add --if-not-exists --system flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak remote-modify --system --no-filter --enable flathub
+failed=0
+for app in "${APPS[@]}"; do
+    flatpak install -y --noninteractive --system flathub "$app" || { echo "échec : $app" >&2; failed=1; }
+done
+# Sans réseau au premier démarrage : on réessaiera (Restart=on-failure, puis au démarrage suivant).
+((failed)) && exit 1
+mkdir -p "$(dirname "$STAMP")"
+touch "$STAMP"

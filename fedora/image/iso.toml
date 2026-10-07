@@ -1,0 +1,15 @@
+# Configuration de l'installeur (Anaconda) pour bootc-image-builder.
+# Les modules Users/Timezone/Network permettent de créer son compte pendant l'installation.
+[customizations.installer.modules]
+enable = [
+  "org.fedoraproject.Anaconda.Modules.Storage",
+  "org.fedoraproject.Anaconda.Modules.Runtime",
+  "org.fedoraproject.Anaconda.Modules.Network",
+  "org.fedoraproject.Anaconda.Modules.Security",
+  "org.fedoraproject.Anaconda.Modules.Services",
+  "org.fedoraproject.Anaconda.Modules.Users",
+  "org.fedoraproject.Anaconda.Modules.Timezone",
+]
+disable = [
+  "org.fedoraproject.Anaconda.Modules.Subscription",
+]

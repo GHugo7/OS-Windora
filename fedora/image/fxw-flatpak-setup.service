@@ -1,0 +1,14 @@
+[Unit]
+Description=Windora : installe Heroic, Bottles, ProtonPlus et Flatseal (Flathub)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=!/var/lib/fxw/flatpak-setup-done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/fxw-flatpak-setup
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

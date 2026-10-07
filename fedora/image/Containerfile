@@ -1,0 +1,19 @@
+# Image Fedora Atomic (KDE) avec tout Windora préinstallé.
+# À construire depuis le dossier fedora/ :
+#   sudo podman build -f image/Containerfile -t localhost/fxw-os:latest .
+ARG FEDORA_VERSION=44
+FROM quay.io/fedora/fedora-kinoite:${FEDORA_VERSION}
+
+COPY install.sh /tmp/fxw/install.sh
+COPY files/ /tmp/fxw/files/
+COPY image/fxw-flatpak-setup /usr/libexec/fxw-flatpak-setup
+COPY image/fxw-flatpak-setup.service /usr/lib/systemd/system/fxw-flatpak-setup.service
+
+# /root pointe vers /var/roothome sur Fedora Atomic : il doit exister pendant la construction.
+RUN mkdir -p /var/roothome && \
+    /tmp/fxw/install.sh --image && \
+    chmod 755 /usr/libexec/fxw-flatpak-setup && \
+    systemctl enable fxw-flatpak-setup.service && \
+    rm -rf /tmp/fxw /var/cache/* /var/log/* /var/roothome
+
+RUN bootc container lint
